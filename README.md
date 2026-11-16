@@ -48,6 +48,8 @@
 
 <br />
 
+> **Fork.** Este repositório (`luisnovais-dev/Mobile-Harness`) é um fork de [`techjarves/Mobile-Harness`](https://github.com/techjarves/Mobile-Harness). Todos os créditos do projeto original pertencem ao seu criador, techjarves. O código segue a licença MIT ([LICENSE](LICENSE)). As mudanças deste fork estão nos commits e na PR de adoção do processo.
+
 ## Download Mobile Harness
 
 <div align="center">
@@ -293,32 +295,50 @@ flowchart TB
 <br />
 
 ### Prerequisites
-* **Android Studio**: Ladybug / Hedgehog or newer
-* **Android SDK**: API Level 36 (`compileSdk 36`)
-* **Java Development Kit**: JDK 17 (Eclipse Temurin or OpenJDK)
-* **Android NDK**: `26.1.10909125`
-* **CMake**: `3.22.1`
+* **Java Development Kit**: JDK 17 (Eclipse Temurin ou OpenJDK). Ubuntu/Debian: `sudo apt install openjdk-17-jdk-headless`.
+* **Android SDK**: platform API 36 (`compileSdk 36`), `platform-tools` e `cmdline-tools`. Build-tools 35.0.0 é instalado pelo Gradle na primeira compilação, desde que as licenças estejam aceitas.
+* **Android NDK**: `28.2.13676358` (valor padrão de `app/build.gradle.kts`; para outra versão, passe `-PmhNdkVersion=<versão>`).
+* **CMake**: `3.22.1`, instalado pelo SDK Manager.
+* **Android Studio** (opcional): Ladybug / Hedgehog ou mais recente. A linha de comando basta.
+* **Submódulos**: `third_party/proot` e `third_party/libandroid-shmem`. Sem eles, o CMake falha.
+
+Instalação do SDK pela linha de comando (com `cmdline-tools` em `$ANDROID_HOME/cmdline-tools/latest`):
+
+```bash
+# Caminho do SDK nesta máquina. Cada máquina define o seu.
+export ANDROID_HOME=/caminho/para/o/Android/Sdk
+sdkmanager --licenses
+sdkmanager "platform-tools" "platforms;android-36" "ndk;28.2.13676358" "cmake;3.22.1"
+```
+
+O build por linha de comando precisa localizar o SDK. Duas formas, que valem para qualquer shell, inclusive o de agentes:
+
+* Definir `ANDROID_HOME` no perfil do shell (`~/.profile` ou `~/.bashrc`), apontando para o SDK instalado nesta máquina. O caminho pode variar entre máquinas, mas precisa estar definido localmente em cada uma.
+* Criar `local.properties` na raiz do checkout com `sdk.dir=<caminho do SDK>`. O arquivo é ignorado pelo git, então vale por checkout e por worktree.
 
 ### Clone & Build Debug APK
 ```bash
 # Clone the repository
-git clone https://github.com/techjarves/Mobile-Harness.git
+git clone https://github.com/luisnovais-dev/Mobile-Harness.git
 cd Mobile-Harness
 
-# Build the standard ARM64 debug binary
-./gradlew assembleDebug
+# Inicializa os submódulos (também dentro de cada worktree)
+git submodule update --init --recursive
 
-# Deploy directly to a connected test device
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+# Build dos dois flavors de debug (offline e online)
+./gradlew assembleOfflineDebug assembleOnlineDebug
+
+# Instalar o APK do flavor escolhido em um dispositivo conectado
+adb install -r app/build/outputs/apk/offline/debug/app-offline-debug.apk
 ```
 
 ### Quality Assurance & Testing
 ```bash
-# Run unit tests
-./gradlew testDebugUnitTest
+# Run unit tests (os dois flavors)
+./gradlew testOfflineDebugUnitTest testOnlineDebugUnitTest
 
 # Run static analysis linter
-./gradlew lintDebug
+./gradlew lint
 ```
 
 ### Target Profiles
@@ -327,7 +347,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
   ```bash
   ./gradlew -PplayBuild=true assembleDebug
   ```
-  Refer to the [Google Play Release Checklist](docs/PLAY_STORE_CHECKLIST.md) for signing and permission policies.
+  Verificado neste fork: compila os dois flavors de debug (`offline` e `online`) com `targetSdk 36`. Não gera APK de release assinado. O bundle da Play exige o keystore de upload (`MH_UPLOAD_STORE_FILE`, `MH_UPLOAD_STORE_PASSWORD`, `MH_UPLOAD_KEY_ALIAS`, `MH_UPLOAD_KEY_PASSWORD`) e a URL pública da política de privacidade (`-PprivacyPolicyUrl`). Refer to the [Google Play Release Checklist](docs/PLAY_STORE_CHECKLIST.md) for signing and permission policies.
 
 </details>
 
