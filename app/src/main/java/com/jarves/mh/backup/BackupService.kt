@@ -183,7 +183,16 @@ class BackupService : Service() {
             appVersionName = BuildConfig.VERSION_NAME,
             appVersionCode = BuildConfig.VERSION_CODE,
             restoredNameSuffix = str(R.string.backup_restored_suffix),
+            // Pasta externa só conta com caminho válido e acesso ao armazenamento agora (Spec #5, §5).
+            externalRootAllowed = { root ->
+                com.jarves.mh.runtime.SharedStoragePath.isValidExternalRoot(root) && com.jarves.mh.runtime.currentSharedStorageAccess(this)
+            },
+            audit = { action, result, path -> externalAudit.record(action, result, path) },
         )
+    }
+
+    private val externalAudit by lazy {
+        com.jarves.mh.runtime.ExternalFolderAuditLog(java.io.File(filesDir, "audit/external-folders.log"))
     }
 
     private fun describe(error: Throwable): String = when (error) {
@@ -191,6 +200,10 @@ class BackupService : Service() {
         is NewerBackupException -> str(R.string.backup_error_newer)
         is NotEnoughSpaceException -> str(R.string.backup_error_space, android.text.format.Formatter.formatShortFileSize(this, error.requiredBytes))
         is InvalidBackupException -> str(R.string.backup_error_invalid)
+        is ExternalStorageUnavailableException -> str(R.string.backup_error_external_unavailable)
+        is ExternalFolderNotEmptyException -> str(R.string.backup_error_external_not_empty)
+        is ExternalFolderSharedException -> str(R.string.backup_error_external_shared)
+        is ExternalFolderInUseException -> str(R.string.backup_error_external_in_use)
         else -> error.message?.takeIf(String::isNotBlank) ?: error.javaClass.simpleName
     }
 

@@ -13,6 +13,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import android.provider.DocumentsContract
 import android.provider.Settings
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -243,8 +244,10 @@ import com.jarves.mh.model.WorkspaceEntry
 import com.jarves.mh.model.projectSlug
 import com.jarves.mh.runtime.RuntimeExecutionService
 import com.jarves.mh.runtime.RuntimeSetupService
+import com.jarves.mh.runtime.SharedStoragePath
 import com.jarves.mh.runtime.StorageRequestFallback
 import com.jarves.mh.runtime.currentSharedStorageAccess
+import com.jarves.mh.runtime.isExternalWorkspaceUnavailable
 import com.jarves.mh.runtime.storageRequestFallback
 import com.jarves.mh.runtime.supportsArm64Runtime
 import com.jarves.mh.runtime.AntigravityAuthStatus
@@ -411,6 +414,11 @@ fun PocketDevApp(viewModel: MainViewModel = viewModel()) {
         state.activeProject != null && state.workspaceVisible -> WorkspaceScreen(
             state = state,
             onBack = viewModel::closeProject,
+            onDeleteProject = { id, deleteFolder ->
+                // O projeto ativo só pode ser apagado depois de fechado (deleteProject recusa o ativo).
+                viewModel.closeProject()
+                viewModel.deleteProject(id, deleteFolder)
+            },
             onSend = viewModel::sendPrompt,
             onStop = viewModel::stopTask,
             onSteerFollowUp = viewModel::steerQueuedFollowUp,
@@ -451,6 +459,9 @@ fun PocketDevApp(viewModel: MainViewModel = viewModel()) {
             onUseSuggestedProjectRoot = viewModel::useSuggestedProjectRoot,
             onExportProject = viewModel::exportActiveProject,
             onAddAttachments = viewModel::addChatAttachments,
+            onOpenContextFolder = viewModel::openContextFolder,
+            onAttachContextFile = viewModel::attachContextFile,
+            onCloseContextFolder = viewModel::closeContextFolder,
             onRemoveAttachment = viewModel::removePendingAttachment,
             onOpenAttachment = viewModel::openChatAttachment,
             onBuildAndRunAndroid = viewModel::buildAndRunAndroidApp,
@@ -3594,23 +3605,93 @@ private fun ClaudeSubscriptionCredentialsStep(
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
+/** Escolha de onde gravar o projeto: área privada ou pasta do aparelho (Spec #5, RF-1 e emenda Task 17). */
+@Composable
+private fun DeviceStorageSection(
+    storageAccess: Boolean,
+    useDeviceStorage: Boolean,
+    onUseDeviceStorage: (Boolean) -> Unit,
+    externalRoot: String,
+    pickedInvalidFolder: Boolean,
+    onPick: () -> Unit,
+    onRequestAccess: () -> Unit,
+    onOpenSettings: () -> Unit,
+) {
+    Text(stringResource(R.string.ws_storage_location), fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        AssistChip(
+            onClick = { onUseDeviceStorage(false) },
+            label = { Text(stringResource(R.string.ws_storage_private)) },
+            leadingIcon = { if (!useDeviceStorage) Icon(Icons.Default.Check, null, Modifier.size(16.dp)) },
+        )
+        AssistChip(
+            onClick = { onUseDeviceStorage(true) },
+            label = { Text(stringResource(R.string.ws_storage_device)) },
+            leadingIcon = { if (useDeviceStorage) Icon(Icons.Default.Check, null, Modifier.size(16.dp)) },
+        )
+    }
+    // Sem permissão, a seção continua visível com o motivo e a forma de conceder (mock, estado 2).
+    if (!storageAccess) {
+        Text(stringResource(R.string.ws_storage_no_access_title), fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+        Text(stringResource(R.string.ws_storage_grant_hint), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            TextButton(onClick = onRequestAccess) { Text(stringResource(R.string.ws_storage_grant_action)) }
+            TextButton(onClick = onOpenSettings) { Text(stringResource(R.string.ws_storage_open_settings)) }
+        }
+        return
+    }
+    if (useDeviceStorage) {
+        Text(stringResource(R.string.ws_storage_active_note), fontSize = 12.sp, color = PocketGreen)
+        Text(stringResource(R.string.ws_storage_picker_hint), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        TextButton(onClick = onPick) { Text(stringResource(R.string.ws_storage_pick)) }
+        if (externalRoot.isNotBlank()) {
+            Text(externalRoot, fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        if (pickedInvalidFolder) {
+            Text(stringResource(R.string.ws_storage_root_invalid), fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+        }
+    }
+}
+
+/** Pedido de acesso a arquivos: no Play, a tela de "todos os arquivos"; no sideload, a permissão de leitura e escrita. */
+@Composable
+private fun rememberSharedStorageRequest(onChanged: () -> Unit): () -> Unit {
+    val context = LocalContext.current
+    val storageLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { onChanged() }
+    val allFilesLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { onChanged() }
+    return {
+        if (BuildConfig.IS_PLAY_BUILD && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            allFilesLauncher.launch(
+                Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:${context.packageName}")),
+            )
+        } else {
+            storageLauncher.launch(arrayOf("android.permission.READ_EXTERNAL_STORAGE", "android.permission.WRITE_EXTERNAL_STORAGE"))
+        }
+    }
+}
+
+private fun openAppSettings(context: Context) {
+    context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}")))
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ProjectsScreen(
     state: AppUiState,
     listState: LazyListState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() },
     onOpen: (Project) -> Unit,
-    onCreate: (String) -> Unit,
-    onCreateAndroid: (String, AndroidTemplate) -> Unit,
+    onCreate: (String, String) -> Unit,
+    onCreateAndroid: (String, AndroidTemplate, String) -> Unit,
     onCreateQuickProject: () -> Unit,
     onImportZip: (Uri) -> Unit,
-    onCloneGit: (String) -> Unit,
+    onCloneGit: (String, String) -> Unit,
     onStartGitHubLogin: () -> Unit,
     onGenerateNewGitHubCode: () -> Unit,
     onRefreshGitHub: () -> Unit,
     onDisconnectGitHub: () -> Unit,
-    onCloneGitHub: (GitHubRepository) -> Unit,
+    onCloneGitHub: (GitHubRepository, String) -> Unit,
     onRenameProject: (String, String) -> Unit,
-    onDeleteProject: (String) -> Unit,
+    onDeleteProject: (String, Boolean) -> Unit,
     onSettings: () -> Unit,
     onPing: () -> Unit,
     onToggleTheme: () -> Unit,
@@ -3625,8 +3706,30 @@ private fun ProjectsScreen(
     var repositorySearch by rememberSaveable { mutableStateOf("") }
     var name by rememberSaveable { mutableStateOf("") }
     var androidTemplate by rememberSaveable { mutableStateOf<AndroidTemplate?>(null) }
+    var useDeviceStorage by rememberSaveable { mutableStateOf(false) }
+    var externalRoot by rememberSaveable { mutableStateOf("") }
+    var pickedInvalidFolder by rememberSaveable { mutableStateOf(false) }
     val projects = state.projects
     val context = LocalContext.current
+    // Relê a permissão ao voltar do seletor, do diálogo do sistema ou das configurações.
+    var storageRefresh by rememberSaveable { mutableStateOf(0) }
+    val storageAccess = remember(storageRefresh) { currentSharedStorageAccess(context) }
+    val requestStorageAccess = rememberSharedStorageRequest { storageRefresh++ }
+    val storageLifecycle = LocalLifecycleOwner.current
+    DisposableEffect(storageLifecycle) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) storageRefresh++
+        }
+        storageLifecycle.lifecycle.addObserver(observer)
+        onDispose { storageLifecycle.lifecycle.removeObserver(observer) }
+    }
+    val pickFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            val path = runCatching { SharedStoragePath.fromDocumentId(DocumentsContract.getTreeDocumentId(uri)) }.getOrNull()
+            externalRoot = path.orEmpty()
+            pickedInvalidFolder = path == null
+        }
+    }
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         onInstallUpdate()
     }
@@ -3871,7 +3974,7 @@ private fun ProjectsScreen(
                         buildRunning = state.androidBuildRunning && state.activeProject?.id == project.id,
                         onOpen = { onOpen(project) },
                         onRename = { onRenameProject(project.id, it) },
-                        onDelete = { onDeleteProject(project.id) },
+                        onDelete = { deleteFolder -> onDeleteProject(project.id, deleteFolder) },
                     )
                 }
             }
@@ -3919,6 +4022,14 @@ private fun ProjectsScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+                DeviceStorageSection(
+                    storageAccess = storageAccess,
+                    useDeviceStorage = useDeviceStorage,
+                    onUseDeviceStorage = { useDeviceStorage = it },
+                    externalRoot = externalRoot,
+                    pickedInvalidFolder = pickedInvalidFolder,
+                    onPick = { pickFolder.launch(null) }, onRequestAccess = requestStorageAccess, onOpenSettings = { openAppSettings(context) },
+                )
                 if (name.isNotBlank()) {
                     Text(
                         stringResource(R.string.ws_terminal_folder, "/workspace/${projectSlug(name)}"),
@@ -3932,12 +4043,17 @@ private fun ProjectsScreen(
         confirmButton = {
             TextButton(
                 onClick = {
-                    androidTemplate?.let { onCreateAndroid(name, it) } ?: onCreate(name)
+                    val chosenRoot = if (useDeviceStorage) externalRoot else ""
+                    androidTemplate?.let { onCreateAndroid(name, it, chosenRoot) }
+                        ?: onCreate(name, chosenRoot)
                     showCreate = false
                     name = ""
                     androidTemplate = null
+                    useDeviceStorage = false
+                    externalRoot = ""
+                    pickedInvalidFolder = false
                 },
-                enabled = name.isNotBlank(),
+                enabled = name.isNotBlank() && (!useDeviceStorage || externalRoot.isNotBlank()),
             ) { Text(stringResource(R.string.ws_create)) }
         },
         dismissButton = { TextButton(onClick = { showCreate = false }) { Text(stringResource(R.string.action_cancel)) } },
@@ -3956,13 +4072,28 @@ private fun ProjectsScreen(
                     placeholder = { Text("https://github.com/owner/repository.git") },
                     singleLine = true,
                 )
+                DeviceStorageSection(
+                    storageAccess = storageAccess,
+                    useDeviceStorage = useDeviceStorage,
+                    onUseDeviceStorage = { useDeviceStorage = it },
+                    externalRoot = externalRoot,
+                    pickedInvalidFolder = pickedInvalidFolder,
+                    onPick = { pickFolder.launch(null) }, onRequestAccess = requestStorageAccess, onOpenSettings = { openAppSettings(context) },
+                )
                 state.gitCloneMessage?.let { Text(it, color = MaterialTheme.colorScheme.primary, fontSize = 12.sp) }
             }
         },
         confirmButton = {
             Button(
-                enabled = gitUrl.isNotBlank() && !state.gitCloneRunning,
-                onClick = { onCloneGit(gitUrl); showGitDialog = false; gitUrl = "" },
+                enabled = gitUrl.isNotBlank() && !state.gitCloneRunning && (!useDeviceStorage || externalRoot.isNotBlank()),
+                onClick = {
+                    onCloneGit(gitUrl, if (useDeviceStorage) externalRoot else "")
+                    showGitDialog = false
+                    gitUrl = ""
+                    useDeviceStorage = false
+                    externalRoot = ""
+                    pickedInvalidFolder = false
+                },
             ) { Text(if (state.gitCloneRunning) stringResource(R.string.projects_cloning) else stringResource(R.string.ws_clone_project)) }
         },
         dismissButton = { TextButton(onClick = { showGitDialog = false }, enabled = !state.gitCloneRunning) { Text(stringResource(R.string.action_cancel)) } },
@@ -4033,13 +4164,24 @@ private fun ProjectsScreen(
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
+                        DeviceStorageSection(
+                            storageAccess = storageAccess,
+                            useDeviceStorage = useDeviceStorage,
+                            onUseDeviceStorage = { useDeviceStorage = it },
+                            externalRoot = externalRoot,
+                            pickedInvalidFolder = pickedInvalidFolder,
+                            onPick = { pickFolder.launch(null) }, onRequestAccess = requestStorageAccess, onOpenSettings = { openAppSettings(context) },
+                        )
                         if (state.githubRepositoriesLoading) LinearProgressIndicator(Modifier.fillMaxWidth())
                         LazyColumn(Modifier.fillMaxWidth().heightIn(max = 350.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             items(filteredRepositories, key = { it.fullName }) { repository ->
                                 Surface(
-                                    modifier = Modifier.fillMaxWidth().clickable(enabled = !state.gitCloneRunning) {
+                                    modifier = Modifier.fillMaxWidth().clickable(enabled = !state.gitCloneRunning && (!useDeviceStorage || externalRoot.isNotBlank())) {
                                         showGitHubDialog = false
-                                        onCloneGitHub(repository)
+                                        onCloneGitHub(repository, if (useDeviceStorage) externalRoot else "")
+                                        useDeviceStorage = false
+                                        externalRoot = ""
+                                        pickedInvalidFolder = false
                                     },
                                     shape = RoundedCornerShape(12.dp),
                                     color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
@@ -4228,9 +4370,10 @@ private fun ProjectCard(
     buildRunning: Boolean,
     onOpen: () -> Unit,
     onRename: (String) -> Unit,
-    onDelete: () -> Unit,
+    onDelete: (Boolean) -> Unit,
 ) {
     var menuOpen by rememberSaveable(project.id) { mutableStateOf(false) }
+    var deleteFolder by rememberSaveable(project.id) { mutableStateOf(false) }
     var showRename by rememberSaveable(project.id) { mutableStateOf(false) }
     var showDelete by rememberSaveable(project.id) { mutableStateOf(false) }
     var renameText by rememberSaveable(project.id) { mutableStateOf(project.name) }
@@ -4306,11 +4449,38 @@ private fun ProjectCard(
         )
     }
     if (showDelete) {
+        val canDeleteFolder = currentSharedStorageAccess(LocalContext.current)
         AlertDialog(
             onDismissRequest = { showDelete = false },
             title = { Text(stringResource(R.string.ws_delete_project_title)) },
-            text = { Text(stringResource(R.string.ws_delete_project_desc)) },
-            confirmButton = { TextButton(onClick = { onDelete(); showDelete = false }) { Text(stringResource(R.string.action_delete), color = MaterialTheme.colorScheme.error) } },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(stringResource(R.string.ws_delete_project_desc))
+                    if (project.externalRoot.isNotBlank()) {
+                        // F7: sem permissão a opção fica desabilitada e explica o motivo, como no painel do projeto.
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(
+                                checked = deleteFolder && canDeleteFolder,
+                                onCheckedChange = { deleteFolder = it },
+                                enabled = canDeleteFolder,
+                            )
+                            Text(stringResource(R.string.ws_delete_device_folder), fontSize = 13.sp)
+                        }
+                        if (!canDeleteFolder) {
+                            Text(stringResource(R.string.ws_storage_delete_needs_access), fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                        } else if (deleteFolder) {
+                            Text(stringResource(R.string.ws_delete_device_folder_warning), fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    onDelete(deleteFolder && canDeleteFolder)
+                    showDelete = false
+                    deleteFolder = false
+                }) { Text(stringResource(R.string.action_delete), color = MaterialTheme.colorScheme.error) }
+            },
             dismissButton = { TextButton(onClick = { showDelete = false }) { Text(stringResource(R.string.action_cancel)) } },
         )
     }
@@ -4406,6 +4576,7 @@ private fun ReadOnlyProjectScreen(
 private fun WorkspaceScreen(
     state: AppUiState,
     onBack: () -> Unit,
+    onDeleteProject: (String, Boolean) -> Unit,
     onSend: (String) -> Unit,
     onStop: () -> Unit,
     onSteerFollowUp: (String) -> Unit,
@@ -4446,6 +4617,9 @@ private fun WorkspaceScreen(
     onUseSuggestedProjectRoot: () -> Unit,
     onExportProject: (Uri, ExportSelection) -> Unit,
     onAddAttachments: (List<Uri>) -> Unit,
+    onOpenContextFolder: (String) -> Unit,
+    onAttachContextFile: (String) -> Unit,
+    onCloseContextFolder: () -> Unit,
     onRemoveAttachment: (String) -> Unit,
     onOpenAttachment: (ChatAttachment) -> Unit,
     onBuildAndRunAndroid: () -> Unit,
@@ -4519,6 +4693,21 @@ private fun WorkspaceScreen(
         contract = ActivityResultContracts.OpenMultipleDocuments(),
         onResult = onAddAttachments,
     )
+    val contextFolderLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree(),
+        onResult = { uri ->
+            val path = uri?.let { runCatching { SharedStoragePath.fromDocumentId(DocumentsContract.getTreeDocumentId(it)) }.getOrNull() }
+            if (path != null) onOpenContextFolder(path)
+        },
+    )
+    if (state.contextFolderPath != null) {
+        ContextFolderDialog(
+            folder = state.contextFolderPath.orEmpty(),
+            files = state.contextFolderFiles,
+            onPick = onAttachContextFile,
+            onDismiss = onCloseContextFolder,
+        )
+    }
     var pendingUploadParent by rememberSaveable { mutableStateOf<String?>(null) }
     val uploadLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments(),
@@ -4824,7 +5013,58 @@ private fun WorkspaceScreen(
             }
         },
     ) { padding ->
-        Box(Modifier.fillMaxSize().padding(padding)) {
+        var showProjectDelete by rememberSaveable { mutableStateOf(false) }
+        val activeProject = state.activeProject
+        Column(Modifier.fillMaxSize().padding(padding)) {
+            // Painel fixo enquanto a pasta externa do projeto não pode ser usada (mock, estado 3).
+            if (activeProject != null && isExternalWorkspaceUnavailable(
+                    activeProject.externalRoot,
+                    currentSharedStorageAccess(context),
+                    File(activeProject.externalRoot).isDirectory,
+                )
+            ) {
+                ExternalStorageUnavailablePanel(
+                    path = activeProject.externalRoot,
+                    canDelete = !state.isRunning && !state.projectTerminalRunning && !state.androidBuildRunning,
+                    onOpenSettings = { openAppSettings(context) },
+                    onDelete = { showProjectDelete = true },
+                )
+            }
+            if (showProjectDelete && activeProject != null) {
+                var deleteFolder by rememberSaveable { mutableStateOf(false) }
+                AlertDialog(
+                    onDismissRequest = { showProjectDelete = false },
+                    title = { Text(stringResource(R.string.ws_delete_project_title)) },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(stringResource(R.string.ws_delete_project_desc))
+                            // Sem permissão o app não consegue apagar a pasta: a opção fica desabilitada e explica o motivo.
+                            val canDeleteFolder = currentSharedStorageAccess(context)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Checkbox(
+                                    checked = deleteFolder && canDeleteFolder,
+                                    onCheckedChange = { deleteFolder = it },
+                                    enabled = canDeleteFolder,
+                                )
+                                Text(stringResource(R.string.ws_delete_device_folder), fontSize = 13.sp)
+                            }
+                            if (!canDeleteFolder) {
+                                Text(stringResource(R.string.ws_storage_delete_needs_access), fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                            } else if (deleteFolder) {
+                                Text(stringResource(R.string.ws_delete_device_folder_warning), fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            showProjectDelete = false
+                            onDeleteProject(activeProject.id, deleteFolder && currentSharedStorageAccess(context))
+                        }) { Text(stringResource(R.string.action_delete), color = MaterialTheme.colorScheme.error) }
+                    },
+                    dismissButton = { TextButton(onClick = { showProjectDelete = false }) { Text(stringResource(R.string.action_cancel)) } },
+                )
+            }
+        Box(Modifier.fillMaxWidth().weight(1f)) {
             when (selectedTab) {
                 WorkspaceTab.CHAT -> ChatTab(
                     state.messages,
@@ -4842,6 +5082,11 @@ private fun WorkspaceScreen(
                     pendingAttachments = state.pendingAttachments,
                     onAttach = {
                         attachmentLauncher.launch(arrayOf("image/*", "text/*", "application/json", "application/xml"))
+                    },
+                    onAttachFromFolder = if (currentSharedStorageAccess(context)) {
+                        { contextFolderLauncher.launch(null) }
+                    } else {
+                        null
                     },
                     onTakePhoto = {
                         runCatching {
@@ -4933,6 +5178,38 @@ private fun WorkspaceScreen(
                     onKeepFileChange,
                 )
                 WorkspaceTab.PREVIEW -> PreviewTab(state.previewReady, state.previewUrl)
+            }
+        }
+        }
+    }
+}
+
+/** Painel do projeto cuja pasta do aparelho não pode ser usada: texto, caminho e ações (mock, estado 3). */
+@Composable
+private fun ExternalStorageUnavailablePanel(
+    path: String,
+    canDelete: Boolean,
+    onOpenSettings: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Card(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+    ) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(
+                stringResource(R.string.ws_storage_panel_title),
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+            Text(
+                stringResource(R.string.ws_storage_panel_body, path),
+                fontSize = 13.sp,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (canDelete) TextButton(onClick = onDelete) { Text(stringResource(R.string.ws_delete_project)) }
+                TextButton(onClick = onOpenSettings) { Text(stringResource(R.string.ws_storage_open_settings)) }
             }
         }
     }
@@ -6351,6 +6628,7 @@ private fun ChatTab(
     agentKind: AgentKind,
     pendingAttachments: List<ChatAttachment>,
     onAttach: () -> Unit,
+    onAttachFromFolder: (() -> Unit)? = null,
     onRemoveAttachment: (String) -> Unit,
     onOpenAttachment: (ChatAttachment) -> Unit,
     onRunInTerminal: (String) -> Unit,
@@ -6557,6 +6835,13 @@ private fun ChatTab(
                                     leadingIcon = { Icon(Icons.Default.AttachFile, null) },
                                     onClick = { attachMenuOpen = false; onAttach() },
                                 )
+                                onAttachFromFolder?.let { openFolder ->
+                                    DropdownMenuItem(
+                                        text = { Text(stringResource(R.string.chat_attach_from_folder)) },
+                                        leadingIcon = { Icon(Icons.Default.Folder, null) },
+                                        onClick = { attachMenuOpen = false; openFolder() },
+                                    )
+                                }
                             }
                         }
 
@@ -7535,4 +7820,31 @@ private fun BrandMark(modifier: Modifier = Modifier, compact: Boolean = false) {
             tint = primary,
         )
     }
+}
+
+@Composable
+private fun ContextFolderDialog(folder: String, files: List<String>, onPick: (String) -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.ws_context_folder_title)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(folder, fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (files.isEmpty()) {
+                    Text(stringResource(R.string.ws_context_folder_empty), fontSize = 13.sp)
+                }
+                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 340.dp)) {
+                    items(files, key = { it }) { name ->
+                        Text(
+                            name,
+                            modifier = Modifier.fillMaxWidth().clickable { onPick(name) }.padding(vertical = 10.dp),
+                            fontSize = 14.sp,
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_cancel)) } },
+    )
 }

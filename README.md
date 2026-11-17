@@ -24,6 +24,8 @@
   [**Architecture**](#architecture) &nbsp;•&nbsp;
   [**Build from Source**](#developer-guides)
 
+  <sub>O botão de download e o badge de release apontam para as releases do upstream <a href="https://github.com/techjarves/Mobile-Harness/releases/latest"><code>techjarves</code></a>. Este fork não publica binários próprios.</sub>
+
 </div>
 
 <br />
@@ -49,6 +51,8 @@
 <br />
 
 > **Fork.** Este repositório (`luisnovais-dev/Mobile-Harness`) é um fork de [`techjarves/Mobile-Harness`](https://github.com/techjarves/Mobile-Harness). Todos os créditos do projeto original pertencem ao seu criador, techjarves. O código segue a licença MIT ([LICENSE](LICENSE)). As mudanças deste fork estão nos commits e na PR de adoção do processo.
+>
+> **Distribuição.** Este fork é focado em processo e **não publica binários próprios**: não há releases publicadas aqui. Todos os botões de download, badges de release e links de APK deste README apontam para as releases oficiais do upstream `techjarves`. Para construir a partir deste fork, veja [Developer Guides](#developer-guides).
 
 ## Download Mobile Harness
 
@@ -62,6 +66,10 @@
 <p align="center">
   <strong>ARM64 Android 9+</strong><br />
   <sub>Direct APK installation · No root required · No USB or wireless ADB pairing</sub>
+</p>
+
+<p align="center">
+  <sub>⬆️ O APK vem das releases oficiais do upstream <a href="https://github.com/techjarves/Mobile-Harness/releases/latest"><code>techjarves</code></a>. Este fork não publica binários próprios.</sub>
 </p>
 
 <br />
@@ -395,7 +403,7 @@ Mobile-Harness/
 <br />
 
 * **Zero Cloud Intermediaries**: Mobile Harness connects your device directly to your chosen AI endpoint. No intermediate relays or telemetry servers collect your prompts or code.
-* **Scoped Storage**: Project imports and exports use Android's official Storage Access Framework (SAF). Project sessions can also reach the shared device storage (`/sdcard`), but only after the user grants storage access: sideload builds request `READ`/`WRITE` storage permission, and Play builds request All files access (`MANAGE_EXTERNAL_STORAGE`). Without the grant, sessions start without `/sdcard`. Revoking the grant takes effect the next time the app starts.
+* **Scoped Storage**: Project imports and exports use Android's official Storage Access Framework (SAF). A project can be created in a folder of the device storage, chosen by the user after granting storage access: sideload builds request `READ`/`WRITE` storage permission, and Play builds request All files access (`MANAGE_EXTERNAL_STORAGE`). The session mounts only that project folder, never the whole shared storage. Without the grant, projects stay in app-private storage. Revoking the grant shows a warning when the project opens, and the session uses the private folder.
 * **Cryptographic Checksums**: Root filesystem archives and Claude Code CLI packages are verified via SHA-256 checksums prior to extraction.
 * **Encrypted Secrets**: API tokens are encrypted in hardware-backed storage via Android Keystore.
 

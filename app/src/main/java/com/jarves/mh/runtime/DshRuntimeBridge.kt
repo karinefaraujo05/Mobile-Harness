@@ -400,6 +400,8 @@ class DshRuntimeBridge(
         activeSessionId?.let { stopSession(it) }
     }
 
+    fun configureProjectBase(projectId: String, resolve: () -> java.io.File) = checkpoints.configureProjectBase(projectId, resolve)
+
     fun configureProjectRoot(projectId: String, rootPath: String) {
         checkpoints.configureProjectRoot(projectId, rootPath)
     }
