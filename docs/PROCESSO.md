@@ -46,7 +46,9 @@ A skill `relato-para-issue` traduz o relato em: pessoa e situação, dor, contor
 
 ### A issue é a Spec
 
-Não há etapa de Spec separada nem gate de aprovação manual. O formulário `feature.yml` (Trabalho) já pede o que a Spec pedia: contexto, capacidade do usuário, comportamento esperado, critérios de aceite verificáveis e as áreas ou arquivos que a mudança toca. **O corpo da issue é a Spec.** A checklist de Tarefas, quando ajuda, vai no próprio corpo.
+Não há etapa de Spec separada nem gate de aprovação manual. O formulário `feature.yml` (Funcionalidade) já pede o que a Spec pedia: contexto, capacidade do usuário, comportamento esperado, critérios de aceite verificáveis e as áreas ou arquivos que a mudança toca. **O corpo da issue é a Spec.** A checklist de Tarefas, quando ajuda, vai no próprio corpo.
+
+### Etapa 1a: aprovação
 
 Uma issue está em elaboração com `status:draft`, e **aprovada** quando o mantenedor aplica `status:approved` (chave `label_aprovacao`). A aprovação só acontece quando a issue tem o que a implementação precisa:
 
@@ -81,6 +83,7 @@ A PR usa o template em `.github/pull_request_template.md`. Ela referencia a issu
 Regras da PR:
 
 - Vinculada a uma issue, com `Closes #<n>` na última fatia, ou `Refs #<n>` nas fatias intermediárias.
+- Exceção: a PR que adota ou atualiza o próprio processo pode não ter issue, por decisão do mantenedor. A descrição da PR registra a decisão e o motivo.
 - Exatamente um label `type:*` (ver [Labels](#labels)). Os demais labels são opcionais.
 - Seção "Documentação" preenchida **quando a mudança for observável** (ver [Gate de documentação](#gate-de-documentação)); refactor interno registra "sem impacto observável".
 - Seção "Roteiro de aceite manual" preenchida quando houver o que testar à mão.
@@ -174,12 +177,12 @@ Hoje o único ambiente ativo é **DEV**: o desenvolvimento local, com dados sint
 ### Identidade de teste
 
 - Usuários sintéticos por perfil e fixtures existem só em DEV. A sessão de teste em DEV é obtida sem interação para o agente.
-- Há um teste que prova a indisponibilidade desses usuários e atalhos em produção. Ele é obrigatório.
+- Há um teste que prova a indisponibilidade desses usuários e atalhos em stable. Ele é obrigatório.
 - O agente nunca usa credencial real de pessoa.
 
 ### Ensaio de migração
 
-O ensaio de migrações acontece em DEV, com dados sintéticos. Ele é isolado de produção e nunca é escrito pelo E2E automático. Antes de migração, a reversão é planejada por tipo:
+O ensaio de migrações acontece em DEV, com dados sintéticos. Ele é isolado de stable e nunca é escrito pelo E2E automático. Antes de migração, a reversão é planejada por tipo:
 
 - **aditiva** (coluna que aceita nulo, tabela nova, índice): conferir que o backup automático do provedor existe e é recente. Não exige dump. A reversão é remover o que foi adicionado.
 - **transformadora** (troca de tipo, backfill, mudança de formato): expandir e contrair. A migração cria o novo ao lado do antigo, o backfill preenche o novo, o código passa a usar o novo, e o antigo só é removido em outra entrega. Antes, dump somente das tabelas afetadas.
@@ -211,7 +214,7 @@ A issue lista os Requisitos de Segurança acionados pela superfície da mudança
 - autorização por perfil e isolamento entre clientes;
 - trilha de auditoria para ações sensíveis;
 - cabeçalhos de segurança em respostas HTTP;
-- guarda do modo de teste, que impede ativar identidade de teste em produção;
+- guarda do modo de teste, que impede ativar identidade de teste em stable;
 - plano de reversão de schema, conforme [Ensaio de migração](#ensaio-de-migração).
 
 ## Interface
