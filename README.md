@@ -50,7 +50,7 @@
 
 > **Fork.** Este repositório (`luisnovais-dev/Mobile-Harness`) é um fork de [`techjarves/Mobile-Harness`](https://github.com/techjarves/Mobile-Harness). Todos os créditos do projeto original pertencem ao seu criador, techjarves. O código segue a licença MIT ([LICENSE](LICENSE)). As mudanças deste fork estão nos commits e na PR de adoção do processo.
 >
-> **Distribuição.** Este fork é focado em processo e **não publica binários próprios**: não há releases nem APKs gerados aqui. Todos os botões de download, badges de release e links de APK deste README apontam para as releases oficiais do upstream `techjarves`. Para construir a partir deste fork, veja [Build a partir do código-fonte](#developer-guides).
+> **Distribuição.** Este fork é focado em processo e **não publica binários próprios**: não há releases publicadas aqui. Todos os botões de download, badges de release e links de APK deste README apontam para as releases oficiais do upstream `techjarves`. Para construir a partir deste fork, veja [Build a partir do código-fonte](#developer-guides).
 
 ## Download Mobile Harness
 
