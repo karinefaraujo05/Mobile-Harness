@@ -24,6 +24,8 @@
   [**Architecture**](#architecture) &nbsp;•&nbsp;
   [**Build from Source**](#developer-guides)
 
+  <sub>O botão de download e o badge de release apontam para as releases do upstream <a href="https://github.com/techjarves/Mobile-Harness/releases/latest"><code>techjarves</code></a>. Este fork não publica binários próprios.</sub>
+
 </div>
 
 <br />
