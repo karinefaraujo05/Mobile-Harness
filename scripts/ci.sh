@@ -54,10 +54,12 @@ else
         ;;
     esac
   done
+  # Cada chave entra uma vez, mesmo que seja pedida mais de uma vez (ex.: lint lint).
   for chave in $CHAVES; do
     for pedida in "$@"; do
       if [ "$pedida" = "$chave" ]; then
         selecionadas="$selecionadas $chave"
+        break
       fi
     done
   done
