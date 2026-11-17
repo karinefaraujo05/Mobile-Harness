@@ -43,11 +43,9 @@ jobs:
       - name: Gradle (com cache)
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Lint
-        run: ./gradlew lint
-
-      - name: Testes unitários (offline e online)
-        run: ./gradlew testOfflineDebugUnitTest testOnlineDebugUnitTest
+      # Comandos lidos da Configuração de docs/PROCESSO.md, não repetidos aqui.
+      - name: Lint e testes unitários (scripts/ci.sh)
+        run: sh scripts/ci.sh lint test
 
       - name: Publicar relatórios (lint e testes)
         if: ${{ always() }}
@@ -85,8 +83,9 @@ jobs:
       - name: Gradle (com cache)
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Assemble debug (offline e online)
-        run: ./gradlew assembleOfflineDebug assembleOnlineDebug
+      # Comando lido da Configuração de docs/PROCESSO.md, não repetido aqui.
+      - name: Assemble debug (scripts/ci.sh)
+        run: sh scripts/ci.sh build
 
       - name: Publicar APKs de debug
         if: ${{ success() }}
