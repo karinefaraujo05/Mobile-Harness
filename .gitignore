@@ -91,3 +91,9 @@ _tmp*
 .claude/tmp-*
 .claude/*.log
 .worktrees/
+
+# Processo (adotar-processo, template v5): backups, dumps e temporários
+_tmp*
+cookies.txt
+*.dump
+*.sql.gz
