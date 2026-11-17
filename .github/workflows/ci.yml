@@ -1,0 +1,98 @@
+name: CI
+
+# Automatiza o gate de qualidade do processo (lint, testes e build) descrito em
+# docs/PROCESSO.md. Sem este workflow, os gates são apenas manuais.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Em PR, cancela a execução em andamento quando chega um push novo. Em push na main, não cancela a
+# execução em andamento. Mas o GitHub mantém só uma execução pendente por grupo: se chegarem vários
+# pushes na main enquanto uma roda, um commit intermediário pode não ter resultado.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Lint e testes unitários
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout (com submódulos)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Componentes do SDK (platform, NDK e CMake exigidos pelo build)
+        run: |
+          sdkmanager --install "platforms;android-36" "ndk;28.2.13676358" "cmake;3.22.1"
+
+      - name: Gradle (com cache)
+        uses: gradle/actions/setup-gradle@v4
+
+      # Comandos lidos da Configuração de docs/PROCESSO.md, não repetidos aqui.
+      - name: Lint e testes unitários (scripts/ci.sh)
+        run: sh scripts/ci.sh lint test
+
+      - name: Publicar relatórios (lint e testes)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: |
+            app/build/reports/lint-results-*.html
+            app/build/reports/tests/**
+          if-no-files-found: ignore
+
+  build:
+    name: Build debug (offline e online)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout (com submódulos)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Componentes do SDK (platform, NDK e CMake exigidos pelo build)
+        run: |
+          sdkmanager --install "platforms;android-36" "ndk;28.2.13676358" "cmake;3.22.1"
+
+      - name: Gradle (com cache)
+        uses: gradle/actions/setup-gradle@v4
+
+      # Comando lido da Configuração de docs/PROCESSO.md, não repetido aqui.
+      - name: Assemble debug (scripts/ci.sh)
+        run: sh scripts/ci.sh build
+
+      - name: Publicar APKs de debug
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: apks-debug
+          path: app/build/outputs/apk/**/debug/*.apk
+          if-no-files-found: ignore
