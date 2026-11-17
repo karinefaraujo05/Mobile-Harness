@@ -20,6 +20,7 @@ jobs:
   quality:
     name: Lint e testes unitários
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout (com submódulos)
         uses: actions/checkout@v4
@@ -61,6 +62,7 @@ jobs:
   build:
     name: Build debug (offline e online)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout (com submódulos)
         uses: actions/checkout@v4
