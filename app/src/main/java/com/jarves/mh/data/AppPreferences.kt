@@ -306,20 +306,7 @@ class AppPreferences(private val context: Context) {
 
     fun saveProjects(projects: List<Project>) {
         val arr = JSONArray()
-        projects.forEach { p ->
-            arr.put(JSONObject().apply {
-                put("id", p.id)
-                put("name", p.name)
-                put("description", p.description)
-                put("language", p.language)
-                put("slug", p.slug)
-                put("rootPath", p.rootPath)
-                put("updatedAtMillis", p.updatedAtMillis)
-                put("kind", p.kind.name)
-                put("type", p.type.name)
-                p.androidTemplate?.let { put("androidTemplate", it.name) }
-            })
-        }
+        projects.forEach { p -> arr.put(projectToJson(p)) }
         preferences.edit().putString("projects_json", arr.toString()).apply()
     }
 
@@ -362,6 +349,7 @@ class AppPreferences(private val context: Context) {
                     rootPath = obj.optString("rootPath", "").takeIf { root ->
                         root.isBlank() || (!root.startsWith('/') && !root.contains(".."))
                     } ?: "",
+                    externalRoot = projectExternalRootFromJson(obj),
                     updatedAtMillis = millis,
                     kind = when (storedKind) {
                         "QUICK_CHAT" -> ProjectKind.QUICK_PROJECT

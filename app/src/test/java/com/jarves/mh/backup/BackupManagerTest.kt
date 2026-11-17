@@ -1,5 +1,6 @@
 package com.jarves.mh.backup
 
+import com.jarves.mh.runtime.ExternalFolderAction
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -206,6 +207,211 @@ class BackupManagerTest {
             BackupCrypto.readHeader(ByteArrayInputStream("PK\u0003\u0004 zip".toByteArray()))
             fail("expected invalid backup")
         } catch (_: InvalidBackupException) {
+        }
+    }
+
+    // Spec #5, RF-12 (D1) and RF-13 (D2): external project folders.
+
+    private fun backupWithExternal(source: File, stores: FakeStores): ByteArray {
+        val output = ByteArrayOutputStream()
+        BackupManager(source, stores, "1.0.9", 10, externalRootAllowed = { true }).createBackup(output, null)
+        return output.toByteArray()
+    }
+
+    private fun entryNames(bytes: ByteArray): List<String> {
+        val stream = ByteArrayInputStream(bytes)
+        BackupCrypto.readHeader(stream)
+        val names = mutableListOf<String>()
+        ZipInputStream(stream).use { zip -> while (true) names += (zip.nextEntry ?: break).name }
+        return names
+    }
+
+    private fun externalStores(root: File): FakeStores = FakeStores(
+        prefs = JSONObject().put(
+            "projects_json",
+            JSONObject().put("t", "string").put(
+                "v",
+                JSONArray().put(JSONObject().put("id", "p1").put("name", "Shop").put("externalRoot", root.path)).toString(),
+            ),
+        ),
+    )
+
+    @Test
+    fun `backup includes the content of the external folder of a project`() {
+        val (source, _) = sourceApp()
+        val external = temp.newFolder("device", "MeuProjeto")
+        external.write("README.md", "on device")
+        val names = entryNames(backupWithExternal(source, externalStores(external)))
+        assertTrue(names.toString(), names.contains("external/p1/README.md"))
+    }
+
+    @Test
+    fun `restore refuses when the external folder already has files and changes nothing`() {
+        val (source, _) = sourceApp()
+        val external = temp.newFolder("device", "MeuProjeto2")
+        external.write("README.md", "on device")
+        val stores = externalStores(external)
+        val bytes = backupWithExternal(source, stores)
+        val target = FakeStores(prefs = projectsPrefs("keep"))
+        val before = projectIds(target)
+        try {
+            BackupManager(source, target, "1.0.9", 10, externalRootAllowed = { true })
+                .restore(ByteArrayInputStream(bytes), null)
+            fail("restore should refuse a non-empty external folder")
+        } catch (expected: ExternalFolderNotEmptyException) {
+            assertEquals(before, projectIds(target))
+            assertEquals("on device", File(external, "README.md").readText())
+        }
+    }
+
+    @Test
+    fun `restore copies the external folder when the destination is missing`() {
+        val (source, _) = sourceApp()
+        val external = temp.newFolder("device", "MeuProjeto3")
+        external.write("README.md", "on device")
+        val stores = externalStores(external)
+        val bytes = backupWithExternal(source, stores)
+        val target = FakeStores(prefs = projectsPrefs("keep"))
+        external.deleteRecursively()
+        BackupManager(source, target, "1.0.9", 10, externalRootAllowed = { true })
+            .restore(ByteArrayInputStream(bytes), null)
+        assertEquals("on device", File(external, "README.md").readText())
+    }
+
+    @Test
+    fun `restore records refused and copied external folders in the audit`() {
+        val (source, _) = sourceApp()
+        val external = temp.newFolder("device", "MeuProjeto4")
+        external.write("README.md", "on device")
+        val stores = externalStores(external)
+        val bytes = backupWithExternal(source, stores)
+        val target = FakeStores(prefs = projectsPrefs("keep"))
+        val events = mutableListOf<String>()
+        val audit = { action: ExternalFolderAction, result: String, _: String -> events += "${action.name}:$result" }
+        try {
+            BackupManager(source, target, "1.0.9", 10, externalRootAllowed = { true }, audit = audit)
+                .restore(ByteArrayInputStream(bytes), null)
+            fail("restore should refuse a non-empty external folder")
+        } catch (expected: ExternalFolderNotEmptyException) {
+            assertEquals(listOf("RESTORE:refused"), events)
+        }
+        external.deleteRecursively()
+        BackupManager(source, target, "1.0.9", 10, externalRootAllowed = { true }, audit = audit)
+            .restore(ByteArrayInputStream(bytes), null)
+        assertEquals(listOf("RESTORE:refused", "RESTORE:ok"), events)
+    }
+
+    // Spec #5, §5: sem acesso ao armazenamento, nenhuma pasta externa é lida nem gravada. F1 e F4.
+
+    @Test
+    fun `backup refuses a project folder it cannot read and writes nothing`() {
+        val (source, _) = sourceApp()
+        val external = temp.newFolder("device", "MeuProjeto5")
+        external.write("README.md", "on device")
+        val output = ByteArrayOutputStream()
+        try {
+            BackupManager(source, externalStores(external), "1.0.9", 10, externalRootAllowed = { false })
+                .createBackup(output, null)
+            fail("backup should refuse a project folder without storage access")
+        } catch (expected: ExternalStorageUnavailableException) {
+            assertEquals(0, output.size())
+        }
+    }
+
+    @Test
+    fun `restore refuses without storage access and changes nothing`() {
+        val (source, _) = sourceApp()
+        val external = temp.newFolder("device", "MeuProjeto6")
+        external.write("README.md", "on device")
+        val bytes = backupWithExternal(source, externalStores(external))
+        external.deleteRecursively()
+        val target = FakeStores(prefs = projectsPrefs("keep"))
+        try {
+            BackupManager(source, target, "1.0.9", 10, externalRootAllowed = { false }).restore(ByteArrayInputStream(bytes), null)
+            fail("restore should refuse a project folder without storage access")
+        } catch (expected: ExternalStorageUnavailableException) {
+            assertEquals(listOf("keep"), projectIds(target))
+            assertTrue(!external.exists())
+        }
+    }
+
+    /** N1 (re-review): dois projetos do backup na mesma pasta não podem ser restaurados pela metade. */
+    @Test
+    fun `restore refuses two projects that share one device folder before changing anything` () {
+        val (source, _) = sourceApp()
+        val external = temp.newFolder("device", "MeuProjeto8")
+        val both = JSONArray()
+            .put(JSONObject().put("id", "p1").put("name", "A").put("externalRoot", external.path))
+            .put(JSONObject().put("id", "p2").put("name", "B").put("externalRoot", external.path))
+        external.write("README.md", "on device")
+        val stores = FakeStores(prefs = JSONObject().put("projects_json", JSONObject().put("t", "string").put("v", both.toString())))
+        val bytes = backupWithExternal(source, stores)
+        external.deleteRecursively()
+        val target = FakeStores(prefs = projectsPrefs("keep"))
+        try {
+            BackupManager(source, target, "1.0.9", 10, externalRootAllowed = { true }).restore(ByteArrayInputStream(bytes), null)
+            fail("restore should refuse projects sharing one folder")
+        } catch (expected: ExternalFolderSharedException) {
+            assertEquals(listOf("keep"), projectIds(target))
+            assertTrue(!external.exists())
+        }
+    }
+
+    /** F10: antes de gravar, a restauração mostra as pastas do aparelho do backup; a leitura não altera nada. */
+    @Test
+    fun `restore preview lists the device folders of the backup and changes nothing`() {
+        val (source, _) = sourceApp()
+        val external = temp.newFolder("device", "MeuProjeto9")
+        external.write("README.md", "on device")
+        val bytes = backupWithExternal(source, externalStores(external))
+        assertEquals(listOf(external.path), BackupManager.externalFoldersIn(ByteArrayInputStream(bytes), null))
+        assertEquals("on device", File(external, "README.md").readText())
+    }
+
+    /** N6: uma pasta dentro da de outro projeto do backup também não pode ser restaurada pela metade. */
+    @Test
+    fun `restore refuses a project folder nested inside another project folder before changing anything`() {
+        val (source, _) = sourceApp()
+        val outer = temp.newFolder("device", "Foo")
+        val inner = File(outer, "Bar")
+        val both = JSONArray()
+            .put(JSONObject().put("id", "p1").put("name", "A").put("externalRoot", outer.path))
+            .put(JSONObject().put("id", "p2").put("name", "B").put("externalRoot", inner.path))
+        val stores = FakeStores(prefs = JSONObject().put("projects_json", JSONObject().put("t", "string").put("v", both.toString())))
+        val bytes = backupWithExternal(source, stores)
+        outer.deleteRecursively()
+        val target = FakeStores(prefs = projectsPrefs("keep"))
+        try {
+            BackupManager(source, target, "1.0.9", 10, externalRootAllowed = { true }).restore(ByteArrayInputStream(bytes), null)
+            fail("restore should refuse nested project folders")
+        } catch (expected: ExternalFolderSharedException) {
+            assertEquals(listOf("keep"), projectIds(target))
+            assertTrue(!outer.exists())
+        }
+    }
+
+    /** N10: restaurar um projeto numa pasta que já é de um projeto do aparelho é recusado antes de gravar, mesmo vazia. */
+    @Test
+    fun `restore refuses a folder that a project already on this phone uses, even when it is empty`() {
+        val (source, _) = sourceApp()
+        val shared = temp.newFolder("device", "MH-Teste")
+        val stores = externalStores(shared)
+        val bytes = backupWithExternal(source, stores)
+        val target = FakeStores(
+            prefs = JSONObject().put(
+                "projects_json",
+                JSONObject().put("t", "string").put(
+                    "v",
+                    JSONArray().put(JSONObject().put("id", "x").put("name", "X").put("externalRoot", shared.path)).toString(),
+                ),
+            ),
+        )
+        try {
+            BackupManager(source, target, "1.0.9", 10, externalRootAllowed = { true }).restore(ByteArrayInputStream(bytes), null)
+            fail("restore should refuse a folder another project on this phone uses")
+        } catch (expected: ExternalFolderInUseException) {
+            assertEquals(listOf("x"), projectIds(target))
+            assertEquals(0, shared.list()?.size ?: -1)
         }
     }
 }

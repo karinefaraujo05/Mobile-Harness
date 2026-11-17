@@ -52,6 +52,20 @@ import com.jarves.mh.network.ProviderApiClient
 import com.jarves.mh.network.GitHubRepository
 import com.jarves.mh.runtime.ClaudeRuntimeBridge
 import com.jarves.mh.runtime.currentSharedStorageAccess
+import com.jarves.mh.runtime.resolveProjectWorkspace
+import com.jarves.mh.runtime.shareCopyDestination
+import com.jarves.mh.runtime.ExternalFolderAction
+import com.jarves.mh.runtime.ExternalFolderAuditLog
+import com.jarves.mh.runtime.SharedStoragePath
+import com.jarves.mh.runtime.clearShareCopies
+import com.jarves.mh.runtime.attachmentMimeType
+import com.jarves.mh.runtime.contextFileWithinFolder
+import com.jarves.mh.runtime.shouldDeleteExternalFolder
+import com.jarves.mh.runtime.storedExternalRoot
+import com.jarves.mh.runtime.FolderRefusal
+import com.jarves.mh.runtime.folderUsedByAnotherProject
+import com.jarves.mh.runtime.newFolderRefusal
+import com.jarves.mh.runtime.validatedNewProjectFolder
 import com.jarves.mh.runtime.DshRuntimeBridge
 import com.jarves.mh.runtime.AgentRegistry
 import com.jarves.mh.runtime.AgentUpdateInfo
@@ -326,6 +340,9 @@ data class AppUiState(
         ChatMessage(fromUser = false, text = "Hi! Tell me what you want to build or change."),
     ),
     val pendingAttachments: List<ChatAttachment> = emptyList(),
+    /** Pasta do aparelho autorizada para anexar contexto nesta sessão (Spec #5, RF-9). */
+    val contextFolderPath: String? = null,
+    val contextFolderFiles: List<String> = emptyList(),
     val pendingApproval: ToolRequest? = null,
     val changes: List<ChangeItem> = emptyList(),
     val activity: List<ActivityItem> = emptyList(),
@@ -526,6 +543,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     init {
+        // Spec #5, RF-10: cópias de compartilhamento de envios anteriores saem ao abrir o app.
+        viewModelScope.launch(Dispatchers.IO) { clearShareCopies(getApplication<Application>().cacheDir) }
         viewModelScope.launch {
             AndroidAppInstaller.events.collect { event ->
                 if (event.operationId != pendingAndroidInstallId) return@collect
@@ -645,7 +664,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         file.isFile && !file.name.startsWith(".claude") && file.name != ".pocket-dev-stacks.json"
                     }.count()
                 } else 0
-                val keep = userMessages > 0 || userFiles > 0
+                // Projeto com pasta no aparelho nunca some sozinho: a pasta do usuário fica fora da limpeza.
+                val keep = userMessages > 0 || userFiles > 0 || project.externalRoot.isNotBlank()
                 if (!keep) {
                     workspaceDir.deleteRecursively()
                     terminalHistoryFile(project.id).delete()
@@ -1218,10 +1238,44 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun projectGuestRoot(project: Project): String = "/workspace/${project.slug}"
 
+    /**
+     * Valida a pasta do aparelho escolhida na criação. Devolve "" para área privada, o caminho
+     * validado com a pasta criada, ou null quando não pode ser usada (sem permissão ou caminho inválido).
+     */
+    private fun validatedExternalRoot(externalRoot: String): String? {
+        val safe = validatedNewProjectFolder(externalRoot, currentSharedStorageAccess(getApplication())) ?: return null
+        if (safe.isNotBlank()) File(safe).mkdirs()
+        return safe
+    }
+
+    /**
+     * Mensagem de recusa da pasta escolhida na criação, ou null quando ela pode ser usada:
+     * pasta inválida (N2), sem acesso ao armazenamento, ou já usada por outro projeto (F2).
+     */
+    private fun newFolderRefusalMessage(externalRoot: String): String? = when (newFolderRefusal(externalRoot, currentSharedStorageAccess(getApplication()))) {
+        FolderRefusal.INVALID_FOLDER -> str(R.string.ws_storage_invalid_folder)
+        FolderRefusal.NO_ACCESS -> str(R.string.ws_storage_unavailable)
+        null -> if (folderUsedByAnotherProject(storedExternalRoot(externalRoot), _state.value.projects.map { it.externalRoot })) {
+            str(R.string.ws_storage_folder_in_use)
+        } else {
+            null
+        }
+    }
+
+    /** Pasta base do projeto: externa quando disponível, senão a área privada (Spec #5, RF-4). */
+    private fun projectBaseDir(project: Project): File {
+        val app = getApplication<Application>()
+        val privateDir = File(app.filesDir, "workspaces/${project.id}").apply { mkdirs() }.canonicalFile
+        return resolveProjectWorkspace(
+            privateDir = privateDir,
+            externalRoot = project.externalRoot,
+            storageAccess = currentSharedStorageAccess(app),
+            externalExists = project.externalRoot.isNotBlank() && File(project.externalRoot).isDirectory,
+        ).apply { mkdirs() }.canonicalFile
+    }
+
     private fun projectWorkspaceRoot(project: Project): File {
-        val base = File(getApplication<Application>().filesDir, "workspaces/${project.id}")
-            .apply { mkdirs() }
-            .canonicalFile
+        val base = projectBaseDir(project)
         if (project.rootPath.isBlank()) return base
         val selected = File(base, project.rootPath).canonicalFile
         require(selected.toPath().startsWith(base.toPath())) { str(R.string.vm_unsafe_project_root) }
@@ -2068,7 +2122,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** Keeps both agent bridges mapped to the same workspace root; the active one is used. */
-    private fun configureBridgeRoots(projectId: String, rootPath: String) {
+    private fun configureBridgeRoots(project: Project) {
+        val projectId = project.id
+        val rootPath = project.rootPath
+        // Resolvida a cada uso: a permissão pode ser revogada depois que o projeto abriu (RF-14).
+        val resolve = { projectBaseDir(project) }
+        claudeRuntime.configureProjectBase(projectId, resolve)
+        dshRuntime.configureProjectBase(projectId, resolve)
+        antigravityRuntime.configureProjectBase(projectId, resolve)
         claudeRuntime.configureProjectRoot(projectId, rootPath)
         dshRuntime.configureProjectRoot(projectId, rootPath)
         antigravityRuntime.configureProjectRoot(projectId, rootPath)
@@ -2985,6 +3046,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openProject(project: Project) {
+        // Spec #5, RF-14: o aviso de pasta externa indisponível é o painel do projeto (PocketDevApp).
         val current = _state.value
         if (current.activeProject?.id == project.id) {
             _state.update {
@@ -3013,7 +3075,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             return
         }
-        configureBridgeRoots(project.id, project.rootPath)
+        configureBridgeRoots(project)
         val terminal = loadProjectTerminal(project)
         val suggestedRoot = if (project.rootPath.isBlank()) detectNestedProjectRoot(project) else null
         val chats = preferences.loadProjectChats(project.id).ifEmpty {
@@ -3095,7 +3157,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (active != null) {
             val chats = preferences.loadProjectChats(active.id)
             val userMessages = chats.sumOf { preferences.loadMessages(active.id, it.id).count { m -> m.fromUser } }
-            val workspaceDir = File(getApplication<Application>().filesDir, "workspaces/${active.id}")
+            val workspaceDir = projectWorkspaceRoot(active)
             val userFiles = if (workspaceDir.isDirectory) {
                 workspaceDir.walkTopDown().filter { file ->
                     file.isFile && !file.name.startsWith(".claude") && file.name != ".pocket-dev-stacks.json"
@@ -3173,12 +3235,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun consumeToast() = _state.update { it.copy(toastMessage = null) }
 
-    fun createProject(name: String) {
+    fun createProject(name: String, externalRoot: String = "") {
         if (name.isBlank()) return
         if (_state.value.isRunning || _state.value.projectTerminalRunning || _state.value.androidBuildRunning) {
             _state.update { it.copy(toastMessage = str(R.string.vm_stop_before_new_project)) }
             return
         }
+        newFolderRefusalMessage(externalRoot)?.let { message ->
+            _state.update { it.copy(toastMessage = message) }
+            return
+        }
+        val safeExternalRoot = if (externalRoot.isBlank()) "" else storedExternalRoot(externalRoot)
+        if (safeExternalRoot.isNotBlank()) File(safeExternalRoot).mkdirs()
         val baseSlug = projectSlug(name)
         val usedSlugs = _state.value.projects.mapTo(mutableSetOf()) { it.slug }
         val slug = generateSequence(1) { it + 1 }
@@ -3189,8 +3257,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             description = str(R.string.vm_starter_web_project),
             language = "TypeScript",
             slug = slug,
+            externalRoot = safeExternalRoot,
         )
-        configureBridgeRoots(project.id, project.rootPath)
+        configureBridgeRoots(project)
         val guestRoot = projectGuestRoot(project)
         _state.update {
             it.copy(
@@ -3226,10 +3295,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         refreshProjectFiles()
     }
 
-    fun createAndroidProject(name: String, template: AndroidTemplate) {
+    fun createAndroidProject(name: String, template: AndroidTemplate, externalRoot: String = "") {
         if (name.isBlank()) return
         if (_state.value.isRunning || _state.value.projectTerminalRunning || _state.value.androidBuildRunning) {
             _state.update { it.copy(toastMessage = str(R.string.an_stop_before_new_project)) }
+            return
+        }
+        newFolderRefusalMessage(externalRoot)?.let { message ->
+            _state.update { it.copy(toastMessage = message) }
+            return
+        }
+        val safeExternalRoot = validatedExternalRoot(externalRoot) ?: run {
+            _state.update { it.copy(toastMessage = str(R.string.ws_storage_unavailable)) }
             return
         }
         val cleanName = name.replace(Regex("\\s+"), " ").trim().take(60)
@@ -3245,8 +3322,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             slug = slug,
             type = ProjectType.ANDROID,
             androidTemplate = template,
+            externalRoot = safeExternalRoot,
         )
-        val workspace = File(getApplication<Application>().filesDir, "workspaces/${project.id}")
+        val workspace = projectBaseDir(project)
         runCatching { AndroidProjectTemplateGenerator.generate(workspace, cleanName, template) }
             .onFailure { error ->
                 _state.update { it.copy(toastMessage = str(R.string.an_could_not_create_android_project)) }
@@ -3434,22 +3512,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun clonePublicGitRepository(url: String) {
-        cloneGitRepository(url = url, repositoryName = null, branch = null, useGitHubCli = false)
+    fun clonePublicGitRepository(url: String, externalRoot: String = "") {
+        cloneGitRepository(url = url, repositoryName = null, branch = null, useGitHubCli = false, externalRoot = externalRoot)
     }
 
-    fun cloneGitHubRepository(repository: GitHubRepository) {
+    fun cloneGitHubRepository(repository: GitHubRepository, externalRoot: String = "") {
         if (_state.value.githubAuthStatus != GitHubAuthStatus.CONNECTED) {
             _state.update { it.copy(githubAuthStatus = GitHubAuthStatus.DISCONNECTED, githubMessage = str(R.string.vm_github_connect_again)) }
             return
         }
-        cloneGitRepository(repository.cloneUrl, repository.fullName, repository.defaultBranch, useGitHubCli = true)
+        cloneGitRepository(repository.cloneUrl, repository.fullName, repository.defaultBranch, useGitHubCli = true, externalRoot = externalRoot)
     }
 
-    private fun cloneGitRepository(url: String, repositoryName: String?, branch: String?, useGitHubCli: Boolean) {
+    private fun cloneGitRepository(url: String, repositoryName: String?, branch: String?, useGitHubCli: Boolean, externalRoot: String = "") {
         if (_state.value.gitCloneRunning || _state.value.projectImporting || _state.value.isRunning || _state.value.projectTerminalRunning || _state.value.androidBuildRunning) return
         val normalized = runCatching { validateGitUrl(url) }.getOrElse { error ->
             _state.update { it.copy(toastMessage = error.message ?: str(R.string.vm_invalid_git_url)) }
+            return
+        }
+        newFolderRefusalMessage(externalRoot)?.let { message ->
+            _state.update { it.copy(toastMessage = message) }
+            return
+        }
+        val safeExternalRoot = validatedExternalRoot(externalRoot) ?: run {
+            _state.update { it.copy(toastMessage = str(R.string.ws_storage_unavailable)) }
+            return
+        }
+        // Git clona em pasta vazia. A pasta do usuário nunca é apagada em falha; só o conteúdo que o clone criou.
+        if (safeExternalRoot.isNotBlank() && File(safeExternalRoot).list()?.isNotEmpty() == true) {
+            _state.update { it.copy(toastMessage = str(R.string.ws_storage_not_empty)) }
             return
         }
         _state.update { it.copy(gitCloneRunning = true, gitCloneMessage = str(R.string.vm_connecting_git)) }
@@ -3458,7 +3549,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 runCatching {
                     val identity = generateQuickChatIdentity(_state.value.projects.mapTo(mutableSetOf()) { it.slug })
                     val projectId = UUID.randomUUID().toString()
-                    val workspace = File(getApplication<Application>().filesDir, "workspaces/$projectId").apply { mkdirs() }
+                    val workspace = if (safeExternalRoot.isNotBlank()) {
+                        File(safeExternalRoot)
+                    } else {
+                        File(getApplication<Application>().filesDir, "workspaces/$projectId")
+                    }.apply { mkdirs() }
                     val output = File(getApplication<Application>().cacheDir, "git-clone-${System.nanoTime()}.log")
                     try {
                         val environment = mutableMapOf(
@@ -3502,9 +3597,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             language = metadata.second,
                             slug = identity.slug,
                             kind = ProjectKind.QUICK_PROJECT,
+                            externalRoot = safeExternalRoot,
                         )
                     } catch (error: Throwable) {
-                        workspace.deleteRecursively()
+                        if (safeExternalRoot.isBlank()) {
+                            workspace.deleteRecursively()
+                        } else {
+                            workspace.listFiles()?.forEach { it.deleteRecursively() }
+                        }
                         throw error
                     } finally {
                         output.delete()
@@ -3854,7 +3954,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         preferences.saveProjects(_state.value.projects)
     }
 
-    fun deleteProject(projectId: String) {
+    fun deleteProject(projectId: String, deleteExternalFolder: Boolean = false) {
         val project = _state.value.projects.firstOrNull { it.id == projectId } ?: return
         if (_state.value.activeProject?.id == projectId || _state.value.isRunning || _state.value.projectTerminalRunning || _state.value.androidBuildRunning) return
         _state.update { current -> current.copy(projects = current.projects.filterNot { it.id == projectId }) }
@@ -3863,6 +3963,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             val filesDir = getApplication<Application>().filesDir
             File(filesDir, "workspaces/${project.id}").deleteRecursively()
+            // RF-11: a pasta do aparelho só é apagada com confirmação explícita, raiz válida e sem outro projeto nela (F2).
+            // Se a exclusão falha em parte, o registro diz "failed", não "ok" (F9).
+            // Projeto já saiu de _state.value.projects acima, então só conta o que ficou (F2, N6).
+            val sharedWithAnother = folderUsedByAnotherProject(project.externalRoot, _state.value.projects.map { it.externalRoot })
+            if (shouldDeleteExternalFolder(project.externalRoot, deleteExternalFolder, sharedWithAnother) &&
+                currentSharedStorageAccess(getApplication())
+            ) {
+                val deleted = File(project.externalRoot).deleteRecursively()
+                externalAudit.record(ExternalFolderAction.DELETE, if (deleted) "ok" else "failed", project.externalRoot)
+            } else if (deleteExternalFolder && sharedWithAnother) {
+                externalAudit.record(ExternalFolderAction.DELETE, "kept-shared", project.externalRoot)
+            }
             terminalHistoryFile(project.id).delete()
             androidBuildRecordFile(project.id).delete()
             preferences.deleteProjectChats(project.id)
@@ -3870,7 +3982,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun detectNestedProjectRoot(project: Project): String? {
-        val base = File(getApplication<Application>().filesDir, "workspaces/${project.id}")
+        val base = projectWorkspaceRoot(project)
         if (!base.isDirectory) return null
         val visible = base.listFiles().orEmpty().filterNot { file ->
             file.name == ".claude" || file.name == ".claude.json"
@@ -3888,7 +4000,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val root = current.suggestedProjectRoot ?: return
         if (current.isRunning || current.projectTerminalRunning) return
         val updated = project.copy(rootPath = root)
-        configureBridgeRoots(updated.id, updated.rootPath)
+        configureBridgeRoots(updated)
         val projects = current.projects.map { if (it.id == updated.id) updated else it }
         val guestRoot = projectGuestRoot(updated)
         preferences.saveProjects(projects)
@@ -4544,20 +4656,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun shareWorkspaceFile(path: String) {
         val project = _state.value.activeProject ?: return
-        runCatching {
-            val file = safeWorkspaceFile(project, path) ?: error(str(R.string.fm_protected))
-            val app = getApplication<Application>()
-            val uri = FileProvider.getUriForFile(app, "${app.packageName}.files", file)
-            val mimeType = android.webkit.MimeTypeMap.getSingleton()
-                .getMimeTypeFromExtension(file.extension.lowercase())
-                ?: "application/octet-stream"
-            app.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-                type = mimeType
-                putExtra(Intent.EXTRA_STREAM, uri)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-            }, str(R.string.fm_share_title, file.name)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        }.onFailure { error ->
-            _state.update { it.copy(toastMessage = str(R.string.fm_failed, error.message ?: str(R.string.vm_unknown_error))) }
+        val app = getApplication<Application>()
+        viewModelScope.launch {
+            runCatching {
+                // F8: a cópia do arquivo roda fora da thread principal; só o Intent volta para a UI.
+                val file = withContext(Dispatchers.IO) {
+                    val source = safeWorkspaceFile(project, path) ?: error(str(R.string.fm_protected))
+                    // Spec #5, RF-10: compartilha uma cópia em cache/camera/, sem ampliar o FileProvider.
+                    // Cada envio tem a sua pasta; as antigas saem na próxima abertura do app (clearShareCopies).
+                    shareCopyDestination(app.cacheDir, source.name, java.util.UUID.randomUUID().toString())
+                        .also { it.parentFile?.mkdirs(); source.copyTo(it, overwrite = true) }
+                }
+                val uri = FileProvider.getUriForFile(app, "${app.packageName}.files", file)
+                val mimeType = android.webkit.MimeTypeMap.getSingleton()
+                    .getMimeTypeFromExtension(file.extension.lowercase())
+                    ?: "application/octet-stream"
+                app.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                    type = mimeType
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                }, str(R.string.fm_share_title, file.name)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            }.onFailure { error ->
+                _state.update { it.copy(toastMessage = str(R.string.fm_failed, error.message ?: str(R.string.vm_unknown_error))) }
+            }
         }
     }
 
@@ -4583,6 +4704,47 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
         }
+    }
+
+    private val externalAudit by lazy {
+        ExternalFolderAuditLog(File(getApplication<Application>().filesDir, "audit/external-folders.log"))
+    }
+
+    /** Abre uma pasta do aparelho para anexar arquivos. Anexar exige permissão de armazenamento no momento do anexo. */
+    fun openContextFolder(path: String) {
+        val app = getApplication<Application>()
+        val folder = File(path)
+        if (!currentSharedStorageAccess(app) || !SharedStoragePath.isValidExternalRoot(path) || !folder.isDirectory) {
+            externalAudit.record(ExternalFolderAction.READ, "unavailable", path)
+            _state.update { it.copy(toastMessage = str(R.string.ws_context_folder_unavailable)) }
+            return
+        }
+        externalAudit.record(ExternalFolderAction.READ, "opened", path)
+        val files = folder.listFiles { file -> file.isFile }.orEmpty().map { it.name }.sorted().take(200)
+        _state.update { it.copy(contextFolderPath = path, contextFolderFiles = files) }
+    }
+
+    fun closeContextFolder() {
+        _state.update { it.copy(contextFolderPath = null, contextFolderFiles = emptyList()) }
+    }
+
+    /** Copia um arquivo da pasta autorizada para os anexos do chat, com os mesmos limites de qualquer anexo. */
+    fun attachContextFile(name: String) {
+        val folderPath = _state.value.contextFolderPath ?: return
+        val folder = File(folderPath)
+        val file = File(folder, name)
+        // F12: a conferência é feita agora, não só na abertura: permissão revogada depois recusa o anexo (RF-9).
+        val allowed = currentSharedStorageAccess(getApplication()) &&
+            SharedStoragePath.isValidExternalRoot(folderPath) &&
+            contextFileWithinFolder(folder, file)
+        if (!allowed) {
+            externalAudit.record(ExternalFolderAction.READ, "refused", file.path)
+            _state.update { it.copy(toastMessage = str(R.string.ws_context_folder_unavailable)) }
+            return
+        }
+        externalAudit.record(ExternalFolderAction.READ, "attached", file.path)
+        closeContextFolder()
+        addChatAttachments(listOf(Uri.fromFile(file)))
     }
 
     fun addChatAttachments(uris: List<Uri>) {
@@ -4649,7 +4811,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun copyChatAttachment(project: Project, chatId: String, uri: Uri): ChatAttachment {
         val resolver = getApplication<Application>().contentResolver
-        var displayName = "attachment"
+        // Uri de arquivo (pasta autorizada) não tem nome no provedor; usa o último segmento do caminho.
+        var displayName = uri.lastPathSegment?.substringAfterLast('/')?.ifBlank { null } ?: "attachment"
         var declaredSize = -1L
         resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { cursor ->
             if (cursor.moveToFirst()) {
@@ -4657,8 +4820,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 cursor.getColumnIndex(OpenableColumns.SIZE).takeIf { it >= 0 }?.let { declaredSize = cursor.getLong(it) }
             }
         }
-        val mimeType = resolver.getType(uri).orEmpty().ifBlank { "application/octet-stream" }
         val extension = displayName.substringAfterLast('.', "").lowercase()
+        // F5: arquivo de pasta externa não tem tipo do provedor; o tipo cai para a extensão.
+        val mimeType = attachmentMimeType(resolver.getType(uri), extension)
         val supportedTextExtensions = setOf(
             "txt", "md", "markdown", "json", "jsonl", "csv", "tsv", "xml", "yaml", "yml", "log",
             "kt", "kts", "java", "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "html", "htm",
