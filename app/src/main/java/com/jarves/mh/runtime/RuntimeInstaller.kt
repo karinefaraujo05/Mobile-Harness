@@ -115,6 +115,8 @@ class RuntimeInstaller(private val context: Context) {
         macosMetadataRepairMarker.writeText("1")
     }
 
+    private fun sharedStorageAccess(): Boolean = currentSharedStorageAccess(context)
+
     /** Returns the already verified runtime without performing network or update checks. */
     fun installedRuntime(): InstalledRuntime {
         check(isInstalled()) { str(R.string.rt_install_incomplete) }
@@ -1581,6 +1583,10 @@ class RuntimeInstaller(private val context: Context) {
                     add(hostPath)
                 }
             }
+            // Armazenamento compartilhado só com permissão concedida (Spec #4).
+            val sharedAccess = sharedStorageAccess()
+            ensureSharedStorageMountPoint(sharedAccess, rootfs)
+            addAll(sharedStorageBinds(sharedAccess))
             add("-b")
             add("${workspace.absolutePath}:$guestWorkspacePath")
             add("-b")

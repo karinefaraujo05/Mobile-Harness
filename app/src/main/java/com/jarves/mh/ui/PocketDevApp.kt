@@ -200,6 +200,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
@@ -214,6 +215,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.jarves.mh.model.ActivityItem
@@ -240,6 +243,9 @@ import com.jarves.mh.model.WorkspaceEntry
 import com.jarves.mh.model.projectSlug
 import com.jarves.mh.runtime.RuntimeExecutionService
 import com.jarves.mh.runtime.RuntimeSetupService
+import com.jarves.mh.runtime.StorageRequestFallback
+import com.jarves.mh.runtime.currentSharedStorageAccess
+import com.jarves.mh.runtime.storageRequestFallback
 import com.jarves.mh.runtime.supportsArm64Runtime
 import com.jarves.mh.runtime.AntigravityAuthStatus
 import com.jarves.mh.runtime.AndroidAction
@@ -4550,6 +4556,51 @@ private fun WorkspaceScreen(
             pendingAndroidAction = null
         },
     )
+    val storageAccessLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions(),
+        onResult = {
+            onRefreshAndroidHealth()
+            // Negação permanente: o diálogo não volta, então a saída é a tela do app.
+            val activity = context as? android.app.Activity
+            val canAskAgain = activity == null ||
+                activity.shouldShowRequestPermissionRationale(android.Manifest.permission.READ_EXTERNAL_STORAGE) ||
+                activity.shouldShowRequestPermissionRationale(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            val fallback = storageRequestFallback(
+                isPlayBuild = BuildConfig.IS_PLAY_BUILD,
+                granted = currentSharedStorageAccess(context),
+                canAskAgain = canAskAgain,
+            )
+            if (fallback == StorageRequestFallback.OPEN_APP_SETTINGS) {
+                context.startActivity(
+                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}")),
+                )
+            }
+        },
+    )
+    val allFilesAccessLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult(),
+        onResult = { onRefreshAndroidHealth() },
+    )
+    // Ao voltar das configurações (ex.: permissão concedida pelo Fix), a checagem é atualizada.
+    val healthLifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(healthLifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) onRefreshAndroidHealth()
+        }
+        healthLifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { healthLifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val requestSharedStorageAccess: () -> Unit = {
+        if (BuildConfig.IS_PLAY_BUILD && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            allFilesAccessLauncher.launch(
+                Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:${context.packageName}")),
+            )
+        } else {
+            storageAccessLauncher.launch(
+                arrayOf("android.permission.READ_EXTERNAL_STORAGE", "android.permission.WRITE_EXTERNAL_STORAGE"),
+            )
+        }
+    }
     val saveApkLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/vnd.android.package-archive"),
         onResult = { uri -> if (uri != null) onSaveAndroidApk(uri) },
@@ -4633,7 +4684,9 @@ private fun WorkspaceScreen(
             onOpenAppDetails = onOpenAndroidAppDetails,
             onUninstallApp = onUninstallAndroidApp,
             onOpenIssue = { issue -> showAndroidBuild = false; onOpenAndroidIssue(issue) },
-            onHealthFix = onAndroidHealthFix,
+            onHealthFix = { fix ->
+                if (fix == AndroidHealthFix.REQUEST_STORAGE_ACCESS) requestSharedStorageAccess() else onAndroidHealthFix(fix)
+            },
             onRefreshHealth = onRefreshAndroidHealth,
             onStartLogcat = onStartAndroidLogcat,
             onStopLogcat = onStopAndroidLogcat,
