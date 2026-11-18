@@ -51,6 +51,7 @@ import com.jarves.mh.network.ModelDiscoveryResult
 import com.jarves.mh.network.ProviderApiClient
 import com.jarves.mh.network.GitHubRepository
 import com.jarves.mh.runtime.ClaudeRuntimeBridge
+import com.jarves.mh.runtime.ProjectGitStore
 import com.jarves.mh.runtime.currentSharedStorageAccess
 import com.jarves.mh.runtime.resolveProjectWorkspace
 import com.jarves.mh.runtime.shareCopyDestination
@@ -1046,6 +1047,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val project = _state.value.projects.firstOrNull { it.id == projectId }
             ?: _state.value.activeProject?.takeIf { it.id == projectId }
             ?: return ProjectTerminalResult(str(R.string.vm_project_unavailable), 1, cwd)
+        // E3 (Spec #6): gitdir ausente em projeto externo: o terminal não roda comando nenhum (ver RuntimeInstaller.process).
+        if (project.externalRoot.isNotBlank() && ProjectGitStore.isGitDirMissingFor(installed.rootfs, File(project.externalRoot))) {
+            return ProjectTerminalResult(str(R.string.vm_git_gitdir_missing), 1, cwd)
+        }
         val workspace = projectWorkspaceRoot(project)
         val guestWorkspacePath = projectGuestRoot(project)
         val marker = "__POCKETDEV_CWD_${UUID.randomUUID()}__"
@@ -3076,6 +3081,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         configureBridgeRoots(project)
+        if (project.externalRoot.isNotBlank()) {
+            // RS-17/E3: o gitdir privado pode sumir (limpeza de dados do app). Aviso no projeto; sem fallback silencioso.
+            viewModelScope.launch(Dispatchers.IO) {
+                val missing = runCatching {
+                    ProjectGitStore.isGitDirMissingFor(installer.installedRuntime().rootfs, File(project.externalRoot))
+                }.getOrDefault(false)
+                if (missing) _state.update { it.copy(toastMessage = str(R.string.vm_git_gitdir_missing)) }
+            }
+        }
         val terminal = loadProjectTerminal(project)
         val suggestedRoot = if (project.rootPath.isBlank()) detectNestedProjectRoot(project) else null
         val chats = preferences.loadProjectChats(project.id).ifEmpty {
@@ -3547,7 +3561,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
                 runCatching {
-                    val identity = generateQuickChatIdentity(_state.value.projects.mapTo(mutableSetOf()) { it.slug })
+                    // Slug com gitdir ainda existente (pasta mantida) não é reutilizado: senão o clone apagaria esse histórico.
+                    val leftoverGitDirs = runCatching { File(installer.installedRuntime().rootfs, "root/gd").list()?.toSet() }.getOrNull().orEmpty()
+                    val identity = generateQuickChatIdentity(_state.value.projects.mapTo(mutableSetOf()) { it.slug } + leftoverGitDirs)
                     val projectId = UUID.randomUUID().toString()
                     val workspace = if (safeExternalRoot.isNotBlank()) {
                         File(safeExternalRoot)
@@ -3563,7 +3579,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             "GH_NO_UPDATE_NOTIFIER" to "1",
                         )
                         val installed = installer.installedRuntime()
-                        val command = if (useGitHubCli && repositoryName != null) {
+                        val external = safeExternalRoot.isNotBlank()
+                        // RS-17 (decisão 3): o host não pode resolver para endereço interno nem de metadados. Resolve no IO, não no main thread.
+                        val addresses = ProjectGitStore.resolveHost(URI(normalized).host ?: "")
+                            ?: throw IllegalStateException(str(R.string.vm_git_host_unresolved))
+                        check(addresses.none(ProjectGitStore::isInternalAddress)) { str(R.string.vm_git_local_unsupported) }
+                        val command = if (external) {
+                            // Spec #6, opção 1: histórico no rootfs privado; a pasta externa recebe só a árvore de trabalho.
+                            check(!useGitHubCli) { str(R.string.vm_git_external_no_gh) }
+                            check(branch.isNullOrBlank() || ProjectGitStore.isValidBranch(branch)) { str(R.string.vm_git_external_invalid_branch) }
+                            check(ProjectGitStore.isAllowedCloneUrl(normalized)) { str(R.string.vm_git_external_invalid_url) }
+                            File(installed.rootfs, ProjectGitStore.GUEST_GIT_ROOT.removePrefix("/")).mkdirs()
+                            ProjectGitStore.cloneArgs(normalized, branch?.takeIf(String::isNotBlank), ProjectGitStore.guestGitDir(identity.slug))
+                        } else if (useGitHubCli && repositoryName != null) {
                             buildList {
                                 addAll(listOf(RuntimeInstaller.GITHUB_CLI_GUEST_PATH, "repo", "clone", repositoryName, ".", "--", "--progress", "--single-branch"))
                                 branch?.takeIf(String::isNotBlank)?.let { addAll(listOf("--branch", it)) }
@@ -3589,6 +3617,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         val exit = process.waitFor()
                         val details = output.readTailText(MAX_PROCESS_OUTPUT_BYTES).trim()
                         check(exit == 0) { details.takeLast(600).ifBlank { str(R.string.vm_git_clone_failed_exit, exit) } }
+                        if (external) {
+                            ProjectGitStore.addWorktreeExclude(ProjectGitStore.excludeFile(installed.rootfs, identity.slug))
+                            val configProcess = installer.process(
+                                installed.proot,
+                                installed.rootfs,
+                                workspace,
+                                environment,
+                                ProjectGitStore.filemodeConfigArgs(),
+                                guestWorkspacePath = "/workspace/${identity.slug}",
+                                outputFile = output,
+                            )
+                            val configExit = configProcess.waitFor()
+                            check(configExit == 0) { str(R.string.vm_git_clone_failed_exit, configExit) }
+                        }
                         val metadata = detectImportedProjectMetadata(workspace)
                         Project(
                             id = projectId,
@@ -3604,6 +3646,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             workspace.deleteRecursively()
                         } else {
                             workspace.listFiles()?.forEach { it.deleteRecursively() }
+                            // Só o histórico deste projeto novo; o slug é gerado agora e não é de outro projeto.
+                            runCatching {
+                                File(installer.installedRuntime().rootfs, ProjectGitStore.guestGitDir(identity.slug).removePrefix("/")).deleteRecursively()
+                            }
                         }
                         throw error
                     } finally {
@@ -3635,7 +3681,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val uri = URI(clean)
         require(uri.scheme.equals("https", ignoreCase = true)) { str(R.string.vm_git_https_only) }
         require(uri.userInfo == null && uri.fragment == null && uri.host?.isNotBlank() == true) { str(R.string.vm_git_no_credentials) }
-        require(uri.host != "localhost" && uri.host != "127.0.0.1" && uri.host != "::1") { str(R.string.vm_git_local_unsupported) }
+        require(uri.host != "localhost" && uri.host?.endsWith(".localhost") != true) { str(R.string.vm_git_local_unsupported) }
         require(uri.path.count { it == '/' } >= 2) { str(R.string.vm_git_url_not_repo) }
         return uri.toASCIIString()
     }
@@ -3967,13 +4013,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             // Se a exclusão falha em parte, o registro diz "failed", não "ok" (F9).
             // Projeto já saiu de _state.value.projects acima, então só conta o que ficou (F2, N6).
             val sharedWithAnother = folderUsedByAnotherProject(project.externalRoot, _state.value.projects.map { it.externalRoot })
+            var folderDeleted = false
             if (shouldDeleteExternalFolder(project.externalRoot, deleteExternalFolder, sharedWithAnother) &&
                 currentSharedStorageAccess(getApplication())
             ) {
-                val deleted = File(project.externalRoot).deleteRecursively()
-                externalAudit.record(ExternalFolderAction.DELETE, if (deleted) "ok" else "failed", project.externalRoot)
+                folderDeleted = File(project.externalRoot).deleteRecursively()
+                externalAudit.record(ExternalFolderAction.DELETE, if (folderDeleted) "ok" else "failed", project.externalRoot)
             } else if (deleteExternalFolder && sharedWithAnother) {
                 externalAudit.record(ExternalFolderAction.DELETE, "kept-shared", project.externalRoot)
+            }
+            // Histórico git privado (opção 1) sai só com a pasta apagada e sem outro projeto nela. Pasta mantida
+            // conserva o .git dela, que aponta para este gitdir.
+            if (project.externalRoot.isNotBlank() && folderDeleted && !sharedWithAnother) {
+                runCatching {
+                    File(installer.installedRuntime().rootfs, ProjectGitStore.guestGitDir(project.slug).removePrefix("/")).deleteRecursively()
+                }
             }
             terminalHistoryFile(project.id).delete()
             androidBuildRecordFile(project.id).delete()

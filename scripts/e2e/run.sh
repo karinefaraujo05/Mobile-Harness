@@ -130,6 +130,14 @@ ui_tap_text() {
   adb_t shell input tap $(( ($1 + $3) / 2 )) $(( ($2 + $4) / 2 ))
 }
 
+# Toca o centro do primeiro campo de texto (EditText) da tela. Falha se não existir.
+ui_tap_edittext() {
+  xy=$(ui_dump | grep -o '<node[^>]*class="android.widget.EditText"[^>]*>' | head -n 1 | grep -o 'bounds="[^"]*"' | grep -o '[0-9][0-9]*')
+  set -- $xy
+  [ -n "${1:-}" ] || return 1
+  adb_t shell input tap $(( ($1 + $3) / 2 )) $(( ($2 + $4) / 2 ))
+}
+
 restart_app() {
   adb_t shell am force-stop "$PKG" >/dev/null 2>&1
   adb_t shell am start -n "$ACTIVITY" >/dev/null 2>&1
@@ -193,10 +201,93 @@ case_project_folder_revoke() {
   record "$status" project-folder-revoke "$evidence"
 }
 
+# Digita um comando de uma linha no terminal do projeto e o envia. O resultado é
+# gravado pelo próprio comando na pasta externa e lido pelo adb (sem ler a tela).
+run_project_terminal() {
+  restart_app
+  ui_tap_text "$E2E_PROJECT" || return 1
+  sleep 2
+  ui_tap_text "Terminal" || return 1
+  sleep 3
+  ui_tap_edittext || return 1
+  sleep 1
+  adb_t shell "input text '$(printf '%s' "$1" | sed 's/ /%s/g')'"
+  sleep 1
+  # O campo é multilinha: Enter só quebra a linha. O envio é a tecla verde do teclado
+  # (canto inferior direito, ~92% da largura e ~91,5% da altura da tela).
+  size=$(adb_t shell wm size | grep -o '[0-9]*x[0-9]*' | tail -n 1)
+  adb_t shell input tap $(( ${size%x*} * 92 / 100 )) $(( ${size#*x} * 915 / 1000 ))
+  sleep 12
+}
+
+# Spec #6, CA-3/CA-10: worktree em .worktrees/ dentro da pasta externa, visível por adb,
+# com .worktrees/ fora do git status. O terminal simula o estado do clone (gitdir privado
+# e info/exclude); a gravação real do clone pelo app é conferida na PR (CA-1).
+case_git_external_worktree() {
+  if [ "$is_arm64" != "1" ]; then
+    record "NOT TESTED" git-external-worktree "requer arm64 (alvo: $abi)"
+    return
+  fi
+  tag="$(date +%H%M%S)"
+  out="e2e-git-$tag.txt"
+  # O terminal aceita comandos curtos: digitar linhas longas perde caracteres. Cada passo é uma digitação.
+  cmd1="exec 2>>e2e-init-$tag.txt; rm -f .git; git init -q --separate-git-dir /root/gd/e2e-$tag; echo .worktrees/ >> /root/gd/e2e-$tag/info/exclude; echo e2e-$tag > e2e-file.txt; git add e2e-file.txt; git -c user.name=e2e -c user.email=e2e@e2e commit -qm e2e"
+  cmd2="exec 2>>$out; git worktree add -q .worktrees/e2e-$tag -b e2e-$tag; cat .worktrees/e2e-$tag/e2e-file.txt > $out; git check-ignore .worktrees/e2e-$tag >> $out; git status -s >> $out; echo done >> $out"
+  # O commit inicial é lento no armazenamento compartilhado: o segundo passo só entra depois que ele terminar.
+  if ! run_project_terminal "$cmd1"; then
+    record "NOT TESTED" git-external-worktree "terminal do projeto não acessível"
+    return
+  fi
+  sleep 30
+  if ! run_project_terminal "$cmd2"; then
+    record "NOT TESTED" git-external-worktree "terminal do projeto não acessível"
+    return
+  fi
+  dir="/storage/emulated/0/$E2E_DIR"
+  if adb_t shell test -f "$dir/.worktrees/e2e-$tag/e2e-file.txt" \
+     && adb_t shell cat "$dir/$out" 2>/dev/null | grep -q "^done"; then
+    if adb_t shell cat "$dir/$out" | grep -q "^\.worktrees/e2e-$tag" \
+       && ! adb_t shell cat "$dir/$out" | grep -q "^?? .worktrees"; then
+      record PASS git-external-worktree "worktree em $E2E_DIR/.worktrees/e2e-$tag visível por adb e fora do git status"
+    else
+      record FAIL git-external-worktree ".worktrees/ aparece no git status"
+    fi
+  else
+    record FAIL git-external-worktree "worktree ou resultado ausente na pasta externa"
+  fi
+}
+
+# Spec #6, CA-9: limitações da pasta externa, como comportamento observado.
+# PASS quando a limitação aparece (symlink não criado, bit de execução não persiste).
+case_git_external_limits() {
+  if [ "$is_arm64" != "1" ]; then
+    record "NOT TESTED" git-external-limits "requer arm64 (alvo: $abi)"
+    return
+  fi
+  tag="$(date +%H%M%S)"
+  out="e2e-limits-$tag.txt"
+  cmd="rm -f .git; git init -q --separate-git-dir /root/gd/lim-$tag; git symbolic-ref HEAD refs/heads/main; echo t > lim-target-$tag.txt; ln -s lim-target-$tag.txt lim-link-$tag 2>/dev/null; if test -L lim-link-$tag; then echo symlink-kept > $out; else echo symlink-missing > $out; fi; echo x > lim-run-$tag.sh; chmod +x lim-run-$tag.sh; stat -c %A lim-run-$tag.sh >> $out; git config core.filemode >> $out; echo done >> $out"
+  if ! run_project_terminal "$cmd"; then
+    record "NOT TESTED" git-external-limits "terminal do projeto não acessível"
+    return
+  fi
+  dir="/storage/emulated/0/$E2E_DIR"
+  res="$(adb_t shell cat "$dir/$out" 2>/dev/null | tr -d '\r')"
+  # O init grava core.filemode=true (teste feito no rootfs). O clone do app grava false logo depois (ProjectGitStore).
+  if printf '%s\n' "$res" | grep -q "^symlink-missing$" \
+     && printf '%s\n' "$res" | grep -q "^-rw-rw----" \
+     && printf '%s\n' "$res" | grep -q "^true$"; then
+    record PASS git-external-limits "limitação observada: symlink ausente, sem bit de execução; init grava core.filemode=true, que o clone do app corrige para false"
+  else
+    record FAIL git-external-limits "comportamento diferente do registrado: $(printf '%s' "$res" | tr '\n' ' ')"
+  fi
+}
+
 run_all() {
   case_project_folder_session
   case_project_folder_revoke
-  pending git-external-worktree "#6"
+  case_git_external_worktree
+  case_git_external_limits
   case_launch
   case_arm64_only
 }
@@ -210,6 +301,8 @@ else
       arm64-only) case_arm64_only ;;
       project-folder-session) case_project_folder_session ;;
       project-folder-revoke) case_project_folder_revoke ;;
+      git-external-worktree) case_git_external_worktree ;;
+      git-external-limits) case_git_external_limits ;;
       *) record "NOT TESTED" "$c" "caso desconhecido" ;;
     esac
   done
